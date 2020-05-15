@@ -27,10 +27,8 @@ type HTTPRocketMQComponent struct {
 
 	alias string
 
-	client       rmq.MQClient
-	producerLock sync.RWMutex
-
-	producers map[string]rmq.MQProducer
+	clients   sync.Map
+	producers sync.Map
 }
 
 func init() {
@@ -49,6 +47,9 @@ func (p *HTTPRocketMQComponent) Start() error {
 	if p.consumer != nil {
 		return p.consumer.Start()
 	}
+
+	logrus.Debugf("httprmq component of '%s' Start()", p.alias)
+
 	return nil
 }
 
@@ -61,14 +62,15 @@ func (p *HTTPRocketMQComponent) Stop() (err error) {
 		}
 	}
 
+	logrus.Debugf("httprmq component of '%s' Stopped()", p.alias)
+
 	return
 }
 
 func NewHTTPRocketMQComponent(alias string, opts ...component.Option) (comp component.Component, err error) {
 
 	rmqComp := &HTTPRocketMQComponent{
-		alias:     alias,
-		producers: make(map[string]rmq.MQProducer),
+		alias: alias,
 	}
 
 	err = rmqComp.init(opts...)
@@ -133,14 +135,8 @@ func (p *HTTPRocketMQComponent) sendMessage(session mail.Session) (err error) {
 		return
 	}
 
-	groupID := session.Query("group_id")
 	topic := session.Query("topic")
 	tags := session.Query("tags")
-
-	if len(groupID) == 0 {
-		err = fmt.Errorf("query of %s is empty", "group_id")
-		return
-	}
 
 	if len(topic) == 0 {
 		err = fmt.Errorf("query of %s is empty", "topic")
@@ -150,6 +146,7 @@ func (p *HTTPRocketMQComponent) sendMessage(session mail.Session) (err error) {
 	endpoint := session.Query("endpoint")
 	accessKey := session.Query("access_key")
 	secretKey := session.Query("secret_key")
+	securityToken := session.Query("security-token")
 	instanceID := session.Query("instance_id")
 	credentialName := session.Query("credential_name")
 
@@ -178,6 +175,7 @@ func (p *HTTPRocketMQComponent) sendMessage(session mail.Session) (err error) {
 	if len(credentialName) > 0 {
 		accessKey = p.opts.Config.GetString("credentials." + credentialName + ".access-key")
 		secretKey = p.opts.Config.GetString("credentials." + credentialName + ".secret-key")
+		securityToken = p.opts.Config.GetString("credentials." + credentialName + ".security-token")
 	}
 
 	if len(accessKey) == 0 {
@@ -186,6 +184,10 @@ func (p *HTTPRocketMQComponent) sendMessage(session mail.Session) (err error) {
 
 	if len(secretKey) == 0 {
 		secretKey = port.Metadata["secret_key"]
+	}
+
+	if len(securityToken) == 0 {
+		securityToken = port.Metadata["security_token"]
 	}
 
 	partition := session.Query("partition")
@@ -239,7 +241,7 @@ func (p *HTTPRocketMQComponent) sendMessage(session mail.Session) (err error) {
 		MessageKey:  payload.GetId(),
 	}
 
-	sendResult, err := p.sendMessageToRMQ(instanceID, topic, msg)
+	sendResult, err := p.sendMessageToRMQ(endpoint, accessKey, secretKey, securityToken, instanceID, topic, msg)
 
 	if err != nil {
 		return
@@ -264,31 +266,41 @@ func (p *HTTPRocketMQComponent) sendMessage(session mail.Session) (err error) {
 	return
 }
 
-func (p *HTTPRocketMQComponent) getProducer(instanceID, topic string) (ret rmq.MQProducer, err error) {
-	key := fmt.Sprintf("%s:%s", instanceID, topic)
+func (p *HTTPRocketMQComponent) getProducer(endpoint, accessKeyID, accessKeySecret, securityToken, instanceID, topic string) (ret rmq.MQProducer, err error) {
 
-	p.producerLock.RLock()
-	if producer, exist := p.producers[key]; exist {
-		ret = producer
-		p.producerLock.RUnlock()
-		return
+	clientKey := fmt.Sprintf("%s:%s", endpoint, accessKeyID)
+	producerKey := fmt.Sprintf("%s:%s:%s:%s", endpoint, accessKeyID, instanceID, topic)
+
+	var client rmq.MQClient
+	var producer rmq.MQProducer
+
+	producerValue, exist := p.producers.Load(producerKey)
+
+	if exist {
+		producer = producerValue.(rmq.MQProducer)
+		return producer, nil
 	}
-	p.producerLock.RUnlock()
 
-	p.producerLock.Lock()
-	defer p.producerLock.Unlock()
+	clientValue, exist := p.clients.Load(clientKey)
 
-	producer := p.client.GetProducer(instanceID, topic)
+	if !exist {
+		client = rmq.NewAliyunMQClient(endpoint, accessKeyID, accessKeySecret, securityToken)
+		p.clients.Store(clientKey, client)
+	} else {
+		client = clientValue.(rmq.MQClient)
+	}
 
-	p.producers[key] = producer
+	producer = client.GetProducer(instanceID, topic)
+
+	p.producers.Store(producerKey, producer)
 
 	ret = producer
 
 	return
 }
 
-func (p *HTTPRocketMQComponent) sendMessageToRMQ(instanceID, topic string, msg rmq.PublishMessageRequest) (result *rmq.PublishMessageResponse, err error) {
-	producer, err := p.getProducer(instanceID, topic)
+func (p *HTTPRocketMQComponent) sendMessageToRMQ(endpoint, accessKeyID, accessKeySecret, securityToken, instanceID, topic string, msg rmq.PublishMessageRequest) (result *rmq.PublishMessageResponse, err error) {
+	producer, err := p.getProducer(endpoint, accessKeyID, accessKeySecret, securityToken, instanceID, topic)
 
 	if err != nil {
 		err = errors.WithMessage(err, "get producer failed")
@@ -311,7 +323,7 @@ func (p *HTTPRocketMQComponent) sendMessageToRMQ(instanceID, topic string, msg r
 			"alias":       p.alias,
 			"topic":       topic,
 			"tags":        msg.MessageTag,
-			"endpoint":    p.client.GetEndpoint(),
+			"endpoint":    endpoint,
 			"key":         msg.MessageKey,
 		},
 	).Debugln("Message sent")
