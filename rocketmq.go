@@ -205,7 +205,7 @@ func (p *HTTPRocketMQComponent) sendMessage(session mail.Session) (err error) {
 		sendSession = newSession
 	}
 
-	payload, ok := sendSession.Payload().Interface().(*protocol.Payload)
+	payload, ok := sendSession.Payload().Copy().Interface().(*protocol.Payload)
 	if !ok {
 		err = errors.New("could not convert session payload to *protocol.Payload")
 		return
