@@ -309,6 +309,7 @@ func (p *HTTPRocketMQComponent) sendMessageToRMQ(endpoint, accessKeyID, accessKe
 
 	sendResult, err := producer.PublishMessage(msg)
 	if err != nil {
+		err = fmt.Errorf("%w, endpoint: %s", err, endpoint)
 		return
 	}
 
